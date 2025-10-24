@@ -1,138 +1,164 @@
 # Tên của workflow
 name: CI - Unit & Integration Tests
 
-# Các sự kiện kích hoạt workflow
 on: [push, pull_request]
 
 jobs:
-  # Job để chạy test cho service "auth"
+  # ==== Job: AUTH ====
   test-auth:
     runs-on: ubuntu-latest
     services:
       mongodb:
-        image: mongo:latest
+        image: mongo:7
         ports:
           - 27017:27017
+        # Sức khoẻ container chỉ là tín hiệu tham khảo, ta vẫn chủ động chờ port
         options: >-
-          --health-cmd "mongosh --eval 'db.adminCommand(\"ping\")'"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+          --health-cmd="mongosh --quiet --eval 'db.adminCommand({ ping: 1 })'"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=12
+
     steps:
-      # Step 1: Checkout mã nguồn từ repository
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Step 2: Cài đặt Node.js và bật caching cho node_modules
-      # Tối ưu: Tương đương với Docker layer cache, giúp tăng tốc việc cài đặt dependencies
       - name: Setup Node.js with cache
         uses: actions/setup-node@v4
         with:
-          node-version: '18' # Hoặc phiên bản Node.js bạn đang dùng
+          node-version: '20'
           cache: 'npm'
           cache-dependency-path: auth/package-lock.json
 
-      # Step 3: Cài đặt dependencies cho service "auth"
-      # `npm ci` sẽ sử dụng cache nếu có, giúp tiết kiệm thời gian
       - name: Install auth dependencies
-        run: npm install --prefix auth
+        run: npm ci --prefix auth
 
-      # Step 4: Tạo file .env cho môi trường test của service "auth"
-      # Tối ưu: Sử dụng MongoDB in-memory, không cần URI thật
-      - name: Create .env file for auth
+      - name: Wait for MongoDB (port 27017)
         run: |
-          echo "JWT_SECRET=${{ secrets.JWT_SECRET }}" >> auth/.env
-          echo "NODE_ENV=test" >> auth/.env
-          echo "MONGODB_AUTH_URI=mongodb://localhost:27017/auth_test" >> auth/.env
+          for i in {1..60}; do
+            nc -z 127.0.0.1 27017 && echo "Mongo is ready" && exit 0
+            echo "Waiting for Mongo... ($i/60)"; sleep 1
+          done
+          echo "Mongo did not become ready in time"; docker ps; exit 1
 
-      # Step 5: Chạy test cho service "auth"
-      # Giả định rằng bạn đã cài đặt "mongodb-memory-server" làm devDependency
+      - name: Create .env for auth tests
+        run: |
+          {
+            echo "JWT_SECRET=${{ secrets.JWT_SECRET }}";
+            echo "NODE_ENV=test";
+            echo "MONGODB_AUTH_URI=mongodb://127.0.0.1:27017/auth_test";
+          } >> auth/.env
+
       - name: Run tests for auth
         run: npm test --prefix auth
 
-  # Job để chạy test cho service "product"
+  # ==== Job: PRODUCT ====
   test-product:
     runs-on: ubuntu-latest
     services:
       mongodb:
-        image: mongo:latest
+        image: mongo:7
         ports:
           - 27017:27017
         options: >-
-          --health-cmd "mongosh --eval 'db.adminCommand(\"ping\")'"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+          --health-cmd="mongosh --quiet --eval 'db.adminCommand({ ping: 1 })'"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=12
+
     steps:
-      # Step 1: Checkout mã nguồn
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Step 2: Cài đặt Node.js và bật caching cho node_modules
-      # Tối ưu: Tương đương với Docker layer cache
       - name: Setup Node.js with cache
         uses: actions/setup-node@v4
         with:
-          node-version: '18' # Hoặc phiên bản Node.js bạn đang dùng
+          node-version: '20'
           cache: 'npm'
           cache-dependency-path: product/package-lock.json
 
-      # Step 3: Cài đặt dependencies cho service "product"
       - name: Install product dependencies
-        run: npm install --prefix product
+        run: npm ci --prefix product
 
-      # Step 4: Tạo file .env cho môi trường test của service "product"
-      # Tối ưu: Không cần thông tin về auth service thật hay RabbitMQ thật
-      - name: Create .env file for product
+      - name: Wait for MongoDB (port 27017)
         run: |
-          echo "JWT_SECRET=${{ secrets.JWT_SECRET }}" >> product/.env
-          echo "NODE_ENV=test" >> product/.env
-          echo "MONGODB_PRODUCT_URI=mongodb://localhost:27017/product_test" >> product/.env
-          echo "LOGIN_TEST_USER=${{ secrets.LOGIN_TEST_USER }}" >> product/.env
-          echo "LOGIN_TEST_PASSWORD=${{ secrets.LOGIN_TEST_PASSWORD }}" >> product/.env
+          for i in {1..60}; do
+            nc -z 127.0.0.1 27017 && echo "Mongo is ready" && exit 0
+            echo "Waiting for Mongo... ($i/60)"; sleep 1
+          done
+          echo "Mongo did not become ready in time"; docker ps; exit 1
 
-      # Step 5: Chạy test cho service "product"
-      # Tối ưu: Không khởi động auth service thật, thay vào đó là mock JWT token trong test
-      - name: Start auth service for product tests
+      - name: Create .env for product tests
         run: |
-          cd auth
-          npm install
-          echo "MONGODB_AUTH_URI=mongodb://localhost:27017/auth_test" > .env
-          echo "JWT_SECRET=${{ secrets.JWT_SECRET }}" >> .env
+          {
+            echo "JWT_SECRET=${{ secrets.JWT_SECRET }}";
+            echo "NODE_ENV=test";
+            echo "MONGODB_PRODUCT_URI=mongodb://127.0.0.1:27017/product_test";
+            echo "LOGIN_TEST_USER=${{ secrets.LOGIN_TEST_USER }}";
+            echo "LOGIN_TEST_PASSWORD=${{ secrets.LOGIN_TEST_PASSWORD }}";
+          } >> product/.env
+
+      # Khởi động auth (local) để product test gọi API đăng ký/đăng nhập
+      - name: Install & start auth (background)
+        run: |
+          pushd auth
+          npm ci
+          {
+            echo "MONGODB_AUTH_URI=mongodb://127.0.0.1:27017/auth_test";
+            echo "JWT_SECRET=${{ secrets.JWT_SECRET }}";
+            echo "NODE_ENV=test";
+            echo "PORT=3000";
+          } > .env
           npm start &
-          sleep 5
-          # Create test user
-          curl -X POST http://localhost:3000/register \
-            -H "Content-Type: application/json" \
-            -d '{"username":"'${{ secrets.LOGIN_TEST_USER }}'","password":"'${{ secrets.LOGIN_TEST_PASSWORD }}'"}' || echo "User might already exist"
-            
+
+          # Đợi auth mở port 3000
+          for i in {1..60}; do
+            nc -z 127.0.0.1 3000 && echo "Auth is ready" && break
+            echo "Waiting for auth service... ($i/60)"; sleep 1
+          done
+          popd
+
+      - name: Create test user (idempotent)
+        run: |
+          for i in {1..10}; do
+            curl -sSf -X POST http://127.0.0.1:3000/register \
+              -H "Content-Type: application/json" \
+              -d '{"username":"'"${{ secrets.LOGIN_TEST_USER }}"'","password":"'"${{ secrets.LOGIN_TEST_PASSWORD }}"'"}' \
+            && break || { echo "Retry create user... ($i/10)"; sleep 1; }
+          done || true
+
       - name: Run tests for product
         run: npm test --prefix product
 
+      - name: Print Mongo logs on failure
+        if: failure()
+        run: docker ps -a && docker logs "$(docker ps --filter ancestor=mongo:7 -q | head -n1)" || true
+
+  # ==== Build & Push (chỉ chạy khi test pass) ====
   build-and-push:
-      needs: [test-auth, test-product]
-      runs-on: ubuntu-latest
-      env:
-        DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-        DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-      strategy:
-        matrix:
-          service: [auth, product, order, api-gateway]
-      steps:
+    needs: [test-auth, test-product]
+    runs-on: ubuntu-latest
+    env:
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+    strategy:
+      matrix:
+        service: [auth, product, order, api-gateway]
+    steps:
       - name: Checkout code
-        uses: actions/checkout@v3.2.0    
-        
+        uses: actions/checkout@v4
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
           install: true
-        
+
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ env.DOCKER_USERNAME }}
           password: ${{ env.DOCKER_PASSWORD }}
-          
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
